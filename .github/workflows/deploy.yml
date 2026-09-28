@@ -33,6 +33,7 @@ jobs:
           # Project sites live at https://<user>.github.io/<repo>/.
           # If this repo IS <user>.github.io, change this to an empty string.
           NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
+          NEXT_PUBLIC_GOOGLE_BOOKS_KEY: ${{ secrets.GOOGLE_BOOKS_KEY }}
 
       - uses: actions/upload-pages-artifact@v3
         with:

@@ -1,3 +1,8 @@
+import { normalizeIsbn } from './isbn';
+
+// Inlined at build time. Restrict the key by HTTP referrer in Google Cloud.
+const GOOGLE_KEY = process.env.NEXT_PUBLIC_GOOGLE_BOOKS_KEY;
+
 export type Book = {
   isbn: string;
   title: string;
@@ -12,7 +17,7 @@ export type Book = {
   link?: string;
 };
 
-type Partial = Omit<Book, 'isbn'> | null;
+type Found = Omit<Book, 'isbn'> | null;
 
 /**
  * Queries Open Library and Google Books in parallel and merges the results.
@@ -22,6 +27,9 @@ type Partial = Omit<Book, 'isbn'> | null;
 export async function lookupBook(isbn: string, signal?: AbortSignal): Promise<Book | null> {
   const [ol, gb] = await Promise.allSettled([fromOpenLibrary(isbn, signal), fromGoogleBooks(isbn, signal)]);
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+  if (ol.status === 'rejected') console.warn('Open Library lookup failed:', ol.reason);
+  if (gb.status === 'rejected') console.warn('Google Books lookup failed:', gb.reason);
 
   const a = ol.status === 'fulfilled' ? ol.value : null;
   const b = gb.status === 'fulfilled' ? gb.value : null;
@@ -52,13 +60,27 @@ export async function lookupBook(isbn: string, signal?: AbortSignal): Promise<Bo
   };
 }
 
-async function fromOpenLibrary(isbn: string, signal?: AbortSignal): Promise<Partial> {
-  const url = `https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&jscmd=data&format=json`;
+/* ---------------- Open Library ---------------- */
+
+async function fromOpenLibrary(isbn: string, signal?: AbortSignal): Promise<Found> {
+  // The bare /api/books path has been returning 404 for every ISBN since
+  // mid-September 2026; /api/books.json serves the same data. If that fails
+  // too, fall back to the search API, which is a separate service.
+  try {
+    return await fromOpenLibraryBooksApi(isbn, signal);
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') throw err;
+    return await fromOpenLibrarySearch(isbn, signal);
+  }
+}
+
+async function fromOpenLibraryBooksApi(isbn: string, signal?: AbortSignal): Promise<Found> {
+  const url = `https://openlibrary.org/api/books.json?bibkeys=ISBN:${isbn}&jscmd=data&format=json`;
   const res = await fetch(url, { signal });
-  if (!res.ok) throw new Error(`Open Library responded ${res.status}`);
+  if (!res.ok) throw new Error(`Open Library Books API responded ${res.status}`);
   const json = await res.json();
   const d = json[`ISBN:${isbn}`];
-  if (!d) return null;
+  if (!d) return null; // This endpoint answers an unknown ISBN with 200 {}.
 
   return {
     title: d.title,
@@ -73,18 +95,64 @@ async function fromOpenLibrary(isbn: string, signal?: AbortSignal): Promise<Part
   };
 }
 
-async function fromGoogleBooks(isbn: string, signal?: AbortSignal): Promise<Partial> {
-  const url = `https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`;
+async function fromOpenLibrarySearch(isbn: string, signal?: AbortSignal): Promise<Found> {
+  const fields = 'key,title,subtitle,author_name,publisher,publish_date,number_of_pages_median,cover_i,subject';
+  const url = `https://openlibrary.org/search.json?isbn=${isbn}&fields=${fields}&limit=1`;
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error(`Open Library search responded ${res.status}`);
+  const json = await res.json();
+  const d = json.docs?.[0];
+  if (!d) return null;
+
+  return {
+    title: d.title,
+    subtitle: d.subtitle,
+    authors: d.author_name ?? [],
+    publisher: d.publisher?.[0],
+    published: d.publish_date?.[0],
+    pages: d.number_of_pages_median,
+    cover: d.cover_i ? `https://covers.openlibrary.org/b/id/${d.cover_i}-L.jpg` : undefined,
+    subjects: d.subject ?? [],
+    link: d.key ? `https://openlibrary.org${d.key}` : undefined,
+  };
+}
+
+/* ---------------- Google Books ---------------- */
+
+type GoogleVolume = {
+  volumeInfo?: {
+    title?: string;
+    subtitle?: string;
+    authors?: string[];
+    publisher?: string;
+    publishedDate?: string;
+    description?: string;
+    pageCount?: number;
+    categories?: string[];
+    infoLink?: string;
+    imageLinks?: { thumbnail?: string; smallThumbnail?: string };
+    industryIdentifiers?: { type: string; identifier: string }[];
+  };
+};
+
+async function fromGoogleBooks(isbn: string, signal?: AbortSignal): Promise<Found> {
+  const url = `https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}${GOOGLE_KEY ? `&key=${GOOGLE_KEY}` : ''}`;
   const res = await fetch(url, { signal });
   if (!res.ok) throw new Error(`Google Books responded ${res.status}`);
   const json = await res.json();
-  const v = json.items?.[0]?.volumeInfo;
+
+  // q=isbn: can fuzzy-match an unknown ISBN to an unrelated book, so only
+  // accept a volume that actually lists this ISBN.
+  const items: GoogleVolume[] = json.items ?? [];
+  const v = items.find((item) =>
+    item.volumeInfo?.industryIdentifiers?.some((id) => normalizeIsbn(id.identifier) === isbn),
+  )?.volumeInfo;
   if (!v) return null;
 
-  const thumb: string | undefined = v.imageLinks?.thumbnail ?? v.imageLinks?.smallThumbnail;
+  const thumb = v.imageLinks?.thumbnail ?? v.imageLinks?.smallThumbnail;
 
   return {
-    title: v.title,
+    title: v.title ?? '',
     subtitle: v.subtitle,
     authors: v.authors ?? [],
     publisher: v.publisher,
